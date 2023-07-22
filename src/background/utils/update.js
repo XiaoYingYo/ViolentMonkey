@@ -15,46 +15,69 @@ addOwnCommands({
    * @param {number} [id] - when omitted, all scripts are checked
    * @return {Promise<number>} number of updated scripts
    */
-  async CheckUpdate(id) {
+    async CheckUpdate(id) {
     const scripts = id ? [getScriptById(id)] : getScripts();
-    let parallel = 2;
-    let results = [];
-    let jobs = [];
-    let tasks = {};
-    for (let script of scripts) {
+    const parallel = 2;
+    const mapOfPools = new Map();
+    /**
+     * @param {string} [hostname] - hostname
+     * @return {Array<Object|number>} pools
+     */
+    const getPoolsByHostname = (hostname) => {
+      let res = mapOfPools.get(hostname)
+      if (!res) {
+        res = [[]];
+        mapOfPools.set(hostname, res);
+      }
+      return res;
+    }
+    /**
+     * @param {string} [urlLike] - downloadURL
+     * @return {string} hostname of downloadURL
+     */
+    const getHostname = (urlLike) => {
+      let res = '';
+      try {
+        res = new URL(urlLike).hostname;
+      } catch (e) { }
+      return res || '';
+    }
+    for (const script of scripts) {
       const curId = script.props.id;
       const urls = getScriptUpdateUrl(script, true);
-      const host = urls && new URL(urls[0]).host;
+      const downloadURL = urls ? urls[0] : '';
+      const downloadURLHost = getHostname(downloadURL) || 'default';
+      const pools = getPoolsByHostname(downloadURLHost)
+      let pool = pools[pools.length - 1];
       if (urls && (id || script.config.enabled || !getOption('updateEnabledScriptsOnly'))) {
-        if (!tasks[host]) {
-          tasks[host] = [];
+        pool.push({ curId, script, urls });
+        if (pool.length >= parallel) {
+          pool = [];
+          pools.push(pool);
         }
-        tasks[host].push({ curId, script, urls });
       }
     }
-    let result = [];
-    for (let host in tasks) {
-      jobs.push((async () => {
-        let Run = [];
-        let hostTasks = tasks[host];
-        for (let i = 0; i < hostTasks.length; i++) {
-          let { curId, script, urls } = hostTasks[i];
-          if (i % parallel === 0) {
-            result.push(await Promise.all(Run));
-            Run = [];
-          }
-          if (!processes[curId]) {
-            processes[curId] = doCheckUpdate(script, urls);
-          }
-          Run.push(processes[curId]);
+    const results = [];
+    const promisesPerSite = [];
+    mapOfPools.forEach(pools => {
+      promisesPerSite.push(new Promise(resolve => {
+        const resultsOfSite = [];
+        for (const pool of pools) {
+          if (pool.length === 0) break;
+          const promiseOfPool = pool.map(entry => {
+            let { curId, script, urls } = entry;
+            return processes[curId] || (processes[curId] = doCheckUpdate(script, urls));
+          });
+          const poolResult = await Promise.all(promiseOfPool); // poolResult = [r x N]; max{N} = parallel
+          resultsOfSite.push.apply(resultsOfSite, poolResult); // resultsOfSite = [r x M]
         }
-        if (Run.length != 0) {
-          result.push(await Promise.all(Run));
-        }
-        return result;
-      })());
+        resolve(resultsOfSite); // all the results of a site
+      }));
+    });
+    const resultsPerSite = await Promise.all(promisesPerSite); // resultsPerSite = [ [r x M] x SiteN ]
+    for (const resultsOfSite of resultsPerSite) {
+      results.push.apply(results, resultsOfSite); // [r x K]
     }
-    results = await Promise.all(jobs);
     const notes = results.filter(r => r?.text);
     if (notes.length) {
       notifyToOpenScripts(
